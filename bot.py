@@ -1,219 +1,191 @@
 import asyncio
 import logging
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message
 from pyrogram.errors import FloodWait, RPCError
 
 # ================= CONFIGURATION =================
-# Replace these with your actual details or keep importing from config
-try:
-    from config import API_ID, API_HASH, BOT_TOKEN, SESSION_STRING, OWNER_ID
-except ImportError:
-    # Fill these if you don't have a config.py
-    API_ID = 21705136
-    API_HASH = "78730e89d196e160b0f1992018c6cb19"
-    BOT_TOKEN = "8573758498:AAEplnYzHwUmjYRFiRSdCAFwyPfYIjk7RIk"
-    SESSION_STRING = "BQFLMbAAb_m5J6AV43eGHnXxxkz8mVJFBOTLcZay_IX7YtklY4S9Z6E0XjPUUoIoM33-BocBlogwRsQsdA8u9YeuLMu1Cmuws3OZISIv3xLz_vAJJAk6mmqeflAkh5X35T6QP-SnbSnd-9FD-fWdP7GyKoJMIrV37RbPym31xaSdOOJjzlf781CIwcoxvTnjqcWzyWlhQS0I7o7nVbmDDCR7rBTlmkMHiN1IjFpxg2Itcc5XjdbG-2JlCOuomw7iWwk3WF-tTbHXCBXNgFEXBzx7mnrY9jr9sCtnx4UHsqq4NiofutkrcX0aZ-TYTwf5RhfGonZjBaHaNZ-lkrREC4YHfqLoWQAAAAGd7PcCAA" # Userbot session is MUST for private channels
-    OWNER_ID = [6944519938] 
+# YOUR CREDENTIALS HERE
+API_ID = 21705136
+API_HASH = "78730e89d196e160b0f1992018c6cb19"
+BOT_TOKEN = "8573758498:AAEplnYzHwUmjYRFiRSdCAFwyPfYIjk7RIk"
+SESSION_STRING = "BQFLMbAAb_m5J6AV43eGHnXxxkz8mVJFBOTLcZay_IX7YtklY4S9Z6E0XjPUUoIoM33-BocBlogwRsQsdA8u9YeuLMu1Cmuws3OZISIv3xLz_vAJJAk6mmqeflAkh5X35T6QP-SnbSnd-9FD-fWdP7GyKoJMIrV37RbPym31xaSdOOJjzlf781CIwcoxvTnjqcWzyWlhQS0I7o7nVbmDDCR7rBTlmkMHiN1IjFpxg2Itcc5XjdbG-2JlCOuomw7iWwk3WF-tTbHXCBXNgFEXBzx7mnrY9jr9sCtnx4UHsqq4NiofutkrcX0aZ-TYTwf5RhfGonZjBaHaNZ-lkrREC4YHfqLoWQAAAAGd7PcCAA"
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize Clients
-app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+userbot = Client("userbot_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-# Userbot is required to see messages in channels and copy them
-userbot = Client(
-    "my_userbot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    session_string=SESSION_STRING
-)
-
-# ================= GLOBAL STORAGE =================
-# Format: { source_chat_id: { 'dest_id': destination_chat_id, 'user_id': owner_id } }
-WATCH_LIST = {}
+# Global Dictionary to control loops: { user_id: False } (True to run, False to stop)
+ACTIVE_TASKS = {}
 
 # ================= HELPER FUNCTIONS =================
 
-async def get_chat_id(client, link: str):
-    """Extracts Chat ID from a link or username."""
-    if "t.me/" in link:
-        if "/+" in link or "joinchat" in link:
-            try:
-                chat = await client.join_chat(link)
-                return chat.id
-            except Exception as e:
-                logger.error(f"Error joining chat: {e}")
-                return None
-        
-        # Handle t.me/c/123456789/10 format (Private links)
-        if "t.me/c/" in link:
-            parts = link.split("/")
-            # Pyrogram needs -100 prefix for private channel IDs derived from links
-            return int("-100" + parts[4])
-        
-        # Handle t.me/username format
-        username = link.split("/")[-1]
-        try:
-            chat = await client.get_chat(username)
-            return chat.id
-        except Exception:
-            return None
-    
-    # If user sent an ID directly (e.g., -100123456)
+def get_link_data(link: str):
+    """
+    Extracts Chat ID and Start Message ID from a link.
+    Returns: (chat_id, message_id) or (None, None)
+    """
     try:
-        return int(link)
-    except ValueError:
-        return None
+        if "t.me/c/" in link:
+            # Format: https://t.me/c/123456789/100
+            parts = link.split("/")
+            chat_id = int("-100" + parts[4])
+            msg_id = int(parts[5])
+            return chat_id, msg_id
+        elif "t.me/" in link:
+            # Format: https://t.me/username/100
+            parts = link.split("/")
+            username = parts[-2]
+            msg_id = int(parts[-1])
+            return username, msg_id
+    except Exception:
+        return None, None
+    return None, None
+
+# ================= CORE BATCH ENGINE =================
+
+async def run_batch_process(bot_client, user_id, source_chat, dest_chat, start_id):
+    """
+    Loops strictly: 1 -> 2 -> 3. 
+    If message doesn't exist yet, it waits (polling), handling future messages.
+    """
+    current_id = start_id
+    status_msg = await bot_client.send_message(
+        user_id, 
+        f"🚀 **Batch Started!**\n\n**Source:** `{source_chat}`\n**Dest:** `{dest_chat}`\n**Current Msg:** `{current_id}`"
+    )
+
+    while ACTIVE_TASKS.get(user_id, False):
+        try:
+            # 1. Try to get the message using USERBOT (Access restricted channels)
+            message = await userbot.get_messages(source_chat, current_id)
+            
+            # 2. Check if message exists (or is empty service message)
+            if not message or message.empty:
+                # Message doesn't exist yet (Future Message). Wait and retry.
+                # This acts as the "Auto Forwarder" for new messages.
+                await asyncio.sleep(5) 
+                continue
+
+            # 3. Skip Service messages (like 'Pinned message', 'Joined group')
+            if message.service:
+                current_id += 1
+                continue
+
+            # 4. Copy the message
+            try:
+                # We use USERBOT to copy because it can access restricted content
+                await userbot.copy_message(
+                    chat_id=dest_chat,
+                    from_chat_id=source_chat,
+                    message_id=current_id
+                )
+                # Log for debugging
+                print(f"Copied: {current_id}")
+                
+                # Update status every 20 messages to avoid FloodWait on status edit
+                if current_id % 20 == 0:
+                    try:
+                        await status_msg.edit_text(f"⚡ **Running...**\n\n**Copied up to:** `{current_id}`")
+                    except:
+                        pass
+                
+                # Move to next message
+                current_id += 1
+                await asyncio.sleep(2) # Safe delay
+
+            except FloodWait as fw:
+                print(f"Sleeping {fw.value}s due to FloodWait")
+                await asyncio.sleep(fw.value)
+            except Exception as e:
+                print(f"Failed to copy {current_id}: {e}")
+                # If fail (e.g. deleted message), skip it
+                current_id += 1
+
+        except FloodWait as fw:
+            await asyncio.sleep(fw.value)
+        except Exception as e:
+            print(f"Global Error: {e}")
+            await asyncio.sleep(5)
+
+    await bot_client.send_message(user_id, f"🛑 **Batch Process Stopped.**\nLast processed ID: `{current_id}`")
 
 # ================= BOT COMMANDS =================
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_command(_, message):
     await message.reply(
-        "👋 **Welcome to the Auto-Forward Bot!**\n\n"
-        "Use `/batch` to start connecting a source channel to a destination channel.\n"
-        "Once connected, any **new** post in the source will be sent to your destination."
+        "👋 **Universal Batch Bot**\n\n"
+        "1. Join the Source Channel with your Userbot.\n"
+        "2. Add Me (Bot) to the Destination Channel as Admin.\n"
+        "3. Send `/batch` to start."
     )
 
 @app.on_message(filters.command("batch") & filters.private)
-async def start_batch(client, message):
+async def batch_command(client, message):
     user_id = message.chat.id
     
-    # 1. Ask for Source Channel
+    if ACTIVE_TASKS.get(user_id, False):
+        return await message.reply("⚠️ You already have a batch process running! Use `/cancel` first.")
+
+    # 1. Get Source Link
     try:
-        source_msg = await client.ask(
+        ask_source = await client.ask(
             user_id, 
-            "**📥 Send the Source Channel Link or ID.**\n"
-            "(The channel where messages come FROM. Make sure the Userbot has joined it.)"
+            "**🔗 Send the Start Message Link**\n\n"
+            "Example: `https://t.me/c/12345/1001`\n"
+            "_(The bot will start copying from this message and continue forever)_"
         )
-    except Exception:
-        return
-    
-    if source_msg.text == "/cancel":
-        return await message.reply("Cancelled.")
+        if ask_source.text == "/cancel": return await message.reply("Cancelled.")
+    except: return
 
-    source_id = await get_chat_id(userbot, source_msg.text)
+    source_chat, start_msg_id = get_link_data(ask_source.text)
     
-    if not source_id:
-        return await message.reply("❌ Could not get Channel ID. Make sure the Userbot is part of that chat or the link is valid.")
+    if not source_chat or not start_msg_id:
+        return await message.reply("❌ Invalid Link format. Please use a link like `https://t.me/c/xxxx/xxxx`")
 
-    # 2. Ask for Destination Channel
+    # 2. Get Destination ID
     try:
-        dest_msg = await client.ask(
+        ask_dest = await client.ask(
             user_id, 
-            "**📤 Send the Destination Channel ID.**\n"
-            "(The channel where messages should go. Make sure the Bot is Admin there.)"
+            "**📤 Send Destination Channel ID**\n"
+            "Example: `-1001234567890`"
         )
-    except Exception:
-        return
+        if ask_dest.text == "/cancel": return await message.reply("Cancelled.")
+        dest_chat = int(ask_dest.text)
+    except: return await message.reply("❌ Invalid ID.")
 
-    if dest_msg.text == "/cancel":
-        return await message.reply("Cancelled.")
-
-    try:
-        dest_id = int(dest_msg.text)
-    except ValueError:
-        return await message.reply("❌ Invalid Destination ID. Please send the numeric ID (e.g., -10012345...).")
-
-    # 3. Save to Watch List
-    WATCH_LIST[source_id] = {'dest_id': dest_id, 'user_id': user_id}
+    # 3. Start the Loop
+    ACTIVE_TASKS[user_id] = True
     
-    await message.reply(
-        f"✅ **Auto-Forwarding Started!**\n\n"
-        f"**Source:** `{source_id}`\n"
-        f"**Destination:** `{dest_id}`\n\n"
-        f"🚀 Any **NEW** message sent to the source will now be copied to the destination.\n"
-        f"Use `/stop` to stop watching."
-    )
-    print(f"Started watching: {source_id} -> {dest_id}")
+    # Run loop in background
+    asyncio.create_task(run_batch_process(client, user_id, source_chat, dest_chat, start_msg_id))
 
 
-@app.on_message(filters.command("stop") & filters.private)
-async def stop_batch(_, message):
-    # This is a simple stop command. For a multi-user bot, you'd filter by user_id.
-    # Here we clear all for the user or just clear the dict.
-    global WATCH_LIST
-    if not WATCH_LIST:
-        await message.reply("Nothing is currently running.")
-        return
-        
-    WATCH_LIST.clear()
-    await message.reply("🛑 All auto-forwarding tasks have been stopped.")
-
-
-@app.on_message(filters.command("status") & filters.private)
-async def status_batch(_, message):
-    if not WATCH_LIST:
-        await message.reply("💤 No active forwarders running.")
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_command(_, message):
+    user_id = message.chat.id
+    if user_id in ACTIVE_TASKS and ACTIVE_TASKS[user_id]:
+        ACTIVE_TASKS[user_id] = False
+        await message.reply("🛑 Stopping the batch process... (might take a few seconds)")
     else:
-        text = "**Active Connections:**\n\n"
-        for src, data in WATCH_LIST.items():
-            text += f"🔹 Source: `{src}` ➡ Dest: `{data['dest_id']}`\n"
-        await message.reply(text)
+        await message.reply("❓ No active process found.")
 
-
-# ================= THE ENGINE (LISTENER) =================
-
-@userbot.on_message(filters.incoming)
-async def auto_forward_engine(client, message: Message):
-    """
-    This function listens to every message the Userbot receives.
-    If the message comes from a Source Channel in WATCH_LIST, it forwards it.
-    """
-    if not message.chat:
-        return
-
-    source_id = message.chat.id
-
-    # Check if this chat is in our watch list
-    if source_id in WATCH_LIST:
-        target_data = WATCH_LIST[source_id]
-        dest_id = target_data['dest_id']
-        
-        try:
-            # COPY the message to the destination (Preserves media, captions, etc.)
-            # We use 'app' (The Bot) to send to destination if possible, 
-            # otherwise 'userbot' if the bot isn't in the destination.
-            # Usually, Bot is admin in destination.
-            
-            # Method 1: Try copying via Bot (Cleaner, acts as bot)
-            try:
-                await app.copy_message(
-                    chat_id=dest_id,
-                    from_chat_id=source_id,
-                    message_id=message.id
-                )
-            except Exception:
-                # Method 2: Fallback to Userbot (If bot fails or can't see source msg details)
-                await client.copy_message(
-                    chat_id=dest_id,
-                    from_chat_id=source_id,
-                    message_id=message.id
-                )
-                
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            # Retry once after sleep
-            await client.copy_message(chat_id=dest_id, from_chat_id=source_id, message_id=message.id)
-        except Exception as e:
-            print(f"Error forwarding message: {e}")
-
-# ================= MAIN EXECUTION =================
+# ================= MAIN =================
 
 async def main():
-    print("Starting Bot and Userbot...")
+    print("Starting Clients...")
     await app.start()
     await userbot.start()
-    print("Bot is ready! Send /batch to start.")
+    print("✅ Bot is Alive!")
     await idle()
     await app.stop()
     await userbot.stop()
 
 if __name__ == "__main__":
-    # Needed for Pyrogram 2.0+
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
-
+    
