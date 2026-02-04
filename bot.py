@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import random
+import re
 from pyrogram import Client, filters, idle
-from pyrogram.errors import FloodWait, RPCError
+from pyrogram.errors import FloodWait, RPCError, ChatAdminRequired, UserAlreadyParticipant
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # ================= CONFIGURATION =================
@@ -16,22 +17,45 @@ logging.basicConfig(level=logging.INFO)
 app = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 userbot = Client("userbot_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-# { task_id: { "source": int, "dest": int, "current": int, "running": bool } }
+# { task_id: { "source": int, "dest": int, "current": int, "running": bool, "user_id": int } }
 BATCH_TASKS = {}
 
 # ================= UTILS =================
 
-async def get_chat_id(link: str):
-    """Resolves any link (private/public) to a Chat ID."""
-    if "t.me/c/" in link:
-        return int("-100" + link.split("/")[4])
-    elif "t.me/" in link:
-        username = link.split("/")[-1]
+async def resolve_chat(link_or_id: str):
+    """Resolves IDs, Public Links, and Private Links to Chat IDs."""
+    # Agar numeric ID hai (-100...)
+    if re.match(r"^-?\d+$", link_or_id):
+        return int(link_or_id)
+    
+    # Private Link: t.me/c/123456789/123
+    if "t.me/c/" in link_or_id:
+        try:
+            parts = link_or_id.split('/')
+            return int("-100" + parts[parts.index('c') + 1])
+        except:
+            return None
+
+    # Invite Link: t.me/+ABCDEFG
+    if "t.me/+" in link_or_id or "t.me/joinchat/" in link_or_id:
+        try:
+            chat = await userbot.join_chat(link_or_id)
+            return chat.id
+        except UserAlreadyParticipant:
+            chat = await userbot.get_chat(link_or_id)
+            return chat.id
+        except Exception:
+            return None
+
+    # Public Link: t.me/username
+    if "t.me/" in link_or_id:
+        username = link_or_id.split('/')[-1]
         try:
             chat = await userbot.get_chat(username)
             return chat.id
-        except:
+        except Exception:
             return None
+            
     return None
 
 def extract_msg_id(link: str):
@@ -53,8 +77,7 @@ async def run_batch_worker(task_id):
             msg = await userbot.get_messages(source, current)
             
             if not msg or msg.empty:
-                # Wait for future messages
-                await asyncio.sleep(5)
+                await asyncio.sleep(5) # Wait for future posts
                 continue
 
             if not msg.service:
@@ -72,13 +95,11 @@ async def run_batch_worker(task_id):
         except Exception:
             await asyncio.sleep(5)
 
-# Real-time listener for "Instant" forwarding of new posts
 @userbot.on_message(filters.incoming)
 async def instant_forwarder(client, message):
     for tid, task in BATCH_TASKS.items():
         if task['running'] and message.chat.id == task['source']:
             try:
-                # If the incoming message is newer than our current loop, copy it instantly
                 if message.id >= task['current']:
                     await userbot.copy_message(task['dest'], message.chat.id, message.id)
             except:
@@ -90,15 +111,13 @@ async def instant_forwarder(client, message):
 async def start_handler(_, message):
     welcome_text = (
         "✨ **Welcome to Premium Forwarder Bot** ✨\n\n"
-        "🚀 I can forward messages from restricted channels and groups in real-time.\n\n"
+        "🚀 Private/Public Links aur IDs dono support karta hoon.\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "📍 **Status:** `Online Baby`\n"
-        "📍 **Mode:** `Batch + Instant ⚡`"
+        "📍 **Status:** `Online 🟢` | **Session:** `Active ✅`"
     )
     buttons = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Start New Batch", callback_data="new_batch")],
-        [InlineKeyboardButton("📊 My Batches", callback_data="view_status")],
-        [InlineKeyboardButton("🛠 Support", url="https://t.me/iscxm")]
+        [InlineKeyboardButton("📊 My Batches", callback_data="view_status")]
     ])
     await message.reply(welcome_text, reply_markup=buttons)
 
@@ -109,22 +128,22 @@ async def cb_handler(client, query: CallbackQuery):
     if query.data == "new_batch":
         await query.message.delete()
         
-        # 1. Source Link
-        src_ask = await client.ask(user_id, "🔗 **Step 1:** Send the **Start Link** from Source.\n(e.g., `https://t.me/c/123/10`)", timeout=60)
-        source_chat = await get_chat_id(src_ask.text)
-        start_id = extract_msg_id(src_ask.text)
+        # 1. Source Input
+        src_ask = await client.ask(user_id, "🔗 **Step 1:** Send the **Source Link or ID**.\n(e.g., `https://t.me/c/123/10` or `-100...`)", timeout=60)
+        source_chat = await resolve_chat(src_ask.text)
+        start_id = extract_msg_id(src_ask.text) or 1
         
-        if not source_chat or not start_id:
-            return await client.send_message(user_id, "❌ **Invalid Link!** Start again with /start")
+        if not source_chat:
+            return await client.send_message(user_id, "❌ **Invalid Source!** Bot ya Userbot ko us chat me hona chahiye.")
 
-        # 2. Destination Link
-        dest_ask = await client.ask(user_id, "📥 **Step 2:** Send the **Destination Link**.\n(e.g., `https://t.me/my_group`)", timeout=60)
-        dest_chat = await get_chat_id(dest_ask.text)
+        # 2. Destination Input
+        dest_ask = await client.ask(user_id, "📥 **Step 2:** Send the **Destination Link or ID**.\n(e.g., `https://t.me/my_group` or `-100...`)", timeout=60)
+        dest_chat = await resolve_chat(dest_ask.text)
         
         if not dest_chat:
-            return await client.send_message(user_id, "❌ **Invalid Destination!** Make sure your Userbot is in that group.")
+            return await client.send_message(user_id, "❌ **Invalid Destination!** Userbot ko us group/channel me join hona zaroori hai.")
 
-        # Start Task
+        # Task Creation
         task_id = random.randint(1000, 9999)
         BATCH_TASKS[task_id] = {
             "source": source_chat,
@@ -135,8 +154,7 @@ async def cb_handler(client, query: CallbackQuery):
         }
         
         asyncio.create_task(run_batch_worker(task_id))
-        
-        await client.send_message(user_id, f"✅ **Batch {task_id} Active!**\n🚀 Now forwarding old and new messages.")
+        await client.send_message(user_id, f"✅ **Batch {task_id} Started!**\n\n🔹 **From:** `{source_chat}`\n🔹 **To:** `{dest_chat}`\n🚀 Old aur New messages ab forward honge.")
 
     elif query.data == "view_status":
         my_tasks = {k: v for k, v in BATCH_TASKS.items() if v.get('user_id') == user_id and v['running']}
@@ -146,7 +164,7 @@ async def cb_handler(client, query: CallbackQuery):
         status_text = "📊 **Active Processing List:**\n\n"
         buttons = []
         for tid, data in my_tasks.items():
-            status_text += f"🔹 **ID:** `{tid}` | **Current:** `{data['current']}`\n"
+            status_text += f"🔹 **ID:** `{tid}` | **Msg:** `{data['current']}`\n"
             buttons.append([InlineKeyboardButton(f"🛑 Stop {tid}", callback_data=f"stop_{tid}")])
         
         buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="back_home")])
@@ -165,13 +183,12 @@ async def cb_handler(client, query: CallbackQuery):
 # ================= BOOT =================
 
 async def boot():
-    print("Initializing...")
     await app.start()
     await userbot.start()
-    print("Bot Started Successfully!")
+    print("Bot & Userbot are Online!")
     await idle()
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(boot())
-    
+        
