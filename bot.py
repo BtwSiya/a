@@ -13,8 +13,8 @@ except ImportError:
     API_ID = 21705136
     API_HASH = "78730e89d196e160b0f1992018c6cb19"
     BOT_TOKEN = "8573758498:AAEplnYzHwUmjYRFiRSdCAFwyPfYIjk7RIk"
-    SESSION_STRING = "" # Userbot session is MUST for private channels
-    OWNER_ID = [123456789] 
+    SESSION_STRING = "BQFLMbAAb_m5J6AV43eGHnXxxkz8mVJFBOTLcZay_IX7YtklY4S9Z6E0XjPUUoIoM33-BocBlogwRsQsdA8u9YeuLMu1Cmuws3OZISIv3xLz_vAJJAk6mmqeflAkh5X35T6QP-SnbSnd-9FD-fWdP7GyKoJMIrV37RbPym31xaSdOOJjzlf781CIwcoxvTnjqcWzyWlhQS0I7o7nVbmDDCR7rBTlmkMHiN1IjFpxg2Itcc5XjdbG-2JlCOuomw7iWwk3WF-tTbHXCBXNgFEXBzx7mnrY9jr9sCtnx4UHsqq4NiofutkrcX0aZ-TYTwf5RhfGonZjBaHaNZ-lkrREC4YHfqLoWQAAAAGd7PcCAA" # Userbot session is MUST for private channels
+    OWNER_ID = [6944519938] 
 
 # Logging Setup
 logging.basicConfig(level=logging.INFO)
