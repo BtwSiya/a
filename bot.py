@@ -1,10 +1,11 @@
 import asyncio
 import logging
+import random
 from pyrogram import Client, filters, idle
 from pyrogram.errors import FloodWait, RPCError
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ================= CONFIGURATION =================
-# YOUR CREDENTIALS HERE
 API_ID = 21705136
 API_HASH = "78730e89d196e160b0f1992018c6cb19"
 BOT_TOKEN = "8573758498:AAEplnYzHwUmjYRFiRSdCAFwyPfYIjk7RIk"
@@ -18,169 +19,222 @@ logger = logging.getLogger(__name__)
 app = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 userbot = Client("userbot_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-# Global Dictionary to control loops: { user_id: False } (True to run, False to stop)
-ACTIVE_TASKS = {}
+# ================= GLOBAL STORAGE =================
+# Stores details of all running batches
+# Format: { task_id: { "user_id": 123, "source": -100x, "dest": -100y, "current": 100, "running": True } }
+BATCH_TASKS = {}
 
 # ================= HELPER FUNCTIONS =================
 
 def get_link_data(link: str):
-    """
-    Extracts Chat ID and Start Message ID from a link.
-    Returns: (chat_id, message_id) or (None, None)
-    """
     try:
         if "t.me/c/" in link:
-            # Format: https://t.me/c/123456789/100
             parts = link.split("/")
             chat_id = int("-100" + parts[4])
             msg_id = int(parts[5])
             return chat_id, msg_id
         elif "t.me/" in link:
-            # Format: https://t.me/username/100
             parts = link.split("/")
             username = parts[-2]
             msg_id = int(parts[-1])
             return username, msg_id
-    except Exception:
+    except:
         return None, None
     return None, None
 
 # ================= CORE BATCH ENGINE =================
 
-async def run_batch_process(bot_client, user_id, source_chat, dest_chat, start_id):
+async def run_batch_process(bot_client, task_id):
     """
-    Loops strictly: 1 -> 2 -> 3. 
-    If message doesn't exist yet, it waits (polling), handling future messages.
+    Independent worker function for each batch.
     """
-    current_id = start_id
-    status_msg = await bot_client.send_message(
-        user_id, 
-        f"🚀 **Batch Started!**\n\n**Source:** `{source_chat}`\n**Dest:** `{dest_chat}`\n**Current Msg:** `{current_id}`"
-    )
+    task = BATCH_TASKS[task_id]
+    user_id = task['user_id']
+    source_chat = task['source']
+    dest_chat = task['dest']
+    current_id = task['current']
 
-    while ACTIVE_TASKS.get(user_id, False):
+    print(f"[Task {task_id}] Started: {source_chat} -> {dest_chat}")
+
+    while BATCH_TASKS.get(task_id) and BATCH_TASKS[task_id]['running']:
         try:
-            # 1. Try to get the message using USERBOT (Access restricted channels)
-            message = await userbot.get_messages(source_chat, current_id)
-            
-            # 2. Check if message exists (or is empty service message)
+            # 1. Try fetch message via Userbot (for Restricted Content)
+            try:
+                message = await userbot.get_messages(source_chat, current_id)
+            except RPCError:
+                # If cannot get message (e.g. userbot banned or chat invalid)
+                await asyncio.sleep(5)
+                continue
+
+            # 2. Handle Non-Existent Messages (Future Wait Mode)
             if not message or message.empty:
-                # Message doesn't exist yet (Future Message). Wait and retry.
-                # This acts as the "Auto Forwarder" for new messages.
+                # Message doesn't exist yet. Wait for it (Future post)
                 await asyncio.sleep(5) 
                 continue
 
-            # 3. Skip Service messages (like 'Pinned message', 'Joined group')
+            # 3. Skip Service Messages
             if message.service:
                 current_id += 1
+                BATCH_TASKS[task_id]['current'] = current_id
                 continue
 
-            # 4. Copy the message
+            # 4. Copy Message
             try:
-                # We use USERBOT to copy because it can access restricted content
+                # Using Userbot copy for Restricted Content support
                 await userbot.copy_message(
                     chat_id=dest_chat,
                     from_chat_id=source_chat,
                     message_id=current_id
                 )
-                # Log for debugging
-                print(f"Copied: {current_id}")
                 
-                # Update status every 20 messages to avoid FloodWait on status edit
-                if current_id % 20 == 0:
-                    try:
-                        await status_msg.edit_text(f"⚡ **Running...**\n\n**Copied up to:** `{current_id}`")
-                    except:
-                        pass
-                
-                # Move to next message
+                # Log Update
+                BATCH_TASKS[task_id]['current'] = current_id + 1
                 current_id += 1
-                await asyncio.sleep(2) # Safe delay
+                
+                # Sleep slightly to prevent flood
+                await asyncio.sleep(2) 
 
             except FloodWait as fw:
-                print(f"Sleeping {fw.value}s due to FloodWait")
+                print(f"[Task {task_id}] Sleeping {fw.value}s")
                 await asyncio.sleep(fw.value)
             except Exception as e:
-                print(f"Failed to copy {current_id}: {e}")
-                # If fail (e.g. deleted message), skip it
+                print(f"[Task {task_id}] Copy Error: {e}")
+                # Skip message if copy fails (e.g., media too large or permission error)
                 current_id += 1
+                BATCH_TASKS[task_id]['current'] = current_id
 
-        except FloodWait as fw:
-            await asyncio.sleep(fw.value)
         except Exception as e:
-            print(f"Global Error: {e}")
+            print(f"[Task {task_id}] Critical Error: {e}")
             await asyncio.sleep(5)
 
-    await bot_client.send_message(user_id, f"🛑 **Batch Process Stopped.**\nLast processed ID: `{current_id}`")
+    # If loop breaks
+    try:
+        await bot_client.send_message(user_id, f"✅ **Batch {task_id} Stopped.**\nLast Processed: `{current_id}`")
+    except:
+        pass
 
 # ================= BOT COMMANDS =================
 
-@app.on_message(filters.command("start") & filters.private)
-async def start_command(_, message):
-    await message.reply(
-        "👋 **Universal Batch Bot**\n\n"
-        "1. Join the Source Channel with your Userbot.\n"
-        "2. Add Me (Bot) to the Destination Channel as Admin.\n"
-        "3. Send `/batch` to start."
+@app.on_message(filters.command(["start", "help"]) & filters.private)
+async def start_cmd(_, message):
+    text = (
+        "🤖 **Multi-Task Batch Bot**\n\n"
+        "Available Commands:\n"
+        "🆕 `/new` - Start a NEW forwarding batch.\n"
+        "📊 `/status` - View running batches & Stop them.\n"
+        "🛑 `/cancel <id>` - Manually stop a batch by ID."
     )
+    await message.reply(text)
 
-@app.on_message(filters.command("batch") & filters.private)
-async def batch_command(client, message):
+@app.on_message(filters.command("new") & filters.private)
+async def new_batch(client, message):
     user_id = message.chat.id
-    
-    if ACTIVE_TASKS.get(user_id, False):
-        return await message.reply("⚠️ You already have a batch process running! Use `/cancel` first.")
 
-    # 1. Get Source Link
+    # 1. Ask for Source
     try:
-        ask_source = await client.ask(
+        ask_src = await client.ask(
             user_id, 
-            "**🔗 Send the Start Message Link**\n\n"
-            "Example: `https://t.me/c/12345/1001`\n"
-            "_(The bot will start copying from this message and continue forever)_"
+            "**🔗 Send the Start Message Link**\n"
+            "(`https://t.me/c/xxxx/100`)",
+            timeout=60
         )
-        if ask_source.text == "/cancel": return await message.reply("Cancelled.")
-    except: return
+    except:
+        return await message.reply("❌ Time out. Send `/new` again.")
+        
+    src_chat, start_id = get_link_data(ask_src.text)
+    if not src_chat:
+        return await message.reply("❌ Invalid Link.")
 
-    source_chat, start_msg_id = get_link_data(ask_source.text)
-    
-    if not source_chat or not start_msg_id:
-        return await message.reply("❌ Invalid Link format. Please use a link like `https://t.me/c/xxxx/xxxx`")
-
-    # 2. Get Destination ID
+    # 2. Ask for Destination
     try:
         ask_dest = await client.ask(
             user_id, 
             "**📤 Send Destination Channel ID**\n"
-            "Example: `-1001234567890`"
+            "(Make sure I am Admin there, e.g., `-100xxxx`)",
+            timeout=60
         )
-        if ask_dest.text == "/cancel": return await message.reply("Cancelled.")
         dest_chat = int(ask_dest.text)
-    except: return await message.reply("❌ Invalid ID.")
+    except:
+        return await message.reply("❌ Invalid ID or Timeout.")
 
-    # 3. Start the Loop
-    ACTIVE_TASKS[user_id] = True
+    # 3. Create Task
+    task_id = random.randint(1000, 9999)
+    BATCH_TASKS[task_id] = {
+        "user_id": user_id,
+        "source": src_chat,
+        "dest": dest_chat,
+        "current": start_id,
+        "running": True
+    }
+
+    # 4. Start Background Worker
+    asyncio.create_task(run_batch_process(client, task_id))
+
+    await message.reply(
+        f"✅ **Batch Started!**\n\n"
+        f"🆔 **ID:** `{task_id}`\n"
+        f"📂 **Source:** `{src_chat}`\n"
+        f"📁 **Dest:** `{dest_chat}`\n"
+        f"🚀 **Starting from:** `{start_id}`\n\n"
+        f"Check `/status` to manage."
+    )
+
+@app.on_message(filters.command("status") & filters.private)
+async def status_handler(client, message):
+    user_id = message.chat.id
     
-    # Run loop in background
-    asyncio.create_task(run_batch_process(client, user_id, source_chat, dest_chat, start_msg_id))
+    # Filter tasks belonging to this user
+    my_tasks = {k: v for k, v in BATCH_TASKS.items() if v['user_id'] == user_id and v['running']}
 
+    if not my_tasks:
+        return await message.reply("💤 No active batches running.\nUse `/new` to start one.")
+
+    text = "**📊 Active Batches:**\n\n"
+    buttons = []
+    
+    for tid, data in my_tasks.items():
+        text += (
+            f"🆔 **{tid}** | 🔄 Msg: `{data['current']}`\n"
+            f"From: `{data['source']}` ➡ To: `{data['dest']}`\n"
+            f"➖➖➖➖➖➖➖\n"
+        )
+        # Add Stop Button for this task
+        buttons.append([InlineKeyboardButton(f"🛑 Stop Batch {tid}", callback_data=f"stop_{tid}")])
+
+    await message.reply(text, reply_markup=InlineKeyboardMarkup(buttons))
+
+@app.on_callback_query(filters.regex(r"^stop_"))
+async def stop_callback(client, callback):
+    try:
+        task_id = int(callback.data.split("_")[1])
+        if task_id in BATCH_TASKS:
+            BATCH_TASKS[task_id]['running'] = False
+            await callback.answer("✅ Batch Stopped!", show_alert=True)
+            await callback.message.edit_text(f"🛑 Batch `{task_id}` has been stopped.")
+        else:
+            await callback.answer("❌ Batch already stopped or not found.", show_alert=True)
+    except Exception as e:
+        await callback.answer(f"Error: {e}")
 
 @app.on_message(filters.command("cancel") & filters.private)
-async def cancel_command(_, message):
-    user_id = message.chat.id
-    if user_id in ACTIVE_TASKS and ACTIVE_TASKS[user_id]:
-        ACTIVE_TASKS[user_id] = False
-        await message.reply("🛑 Stopping the batch process... (might take a few seconds)")
-    else:
-        await message.reply("❓ No active process found.")
+async def manual_cancel(client, message):
+    try:
+        task_id = int(message.command[1])
+        if task_id in BATCH_TASKS:
+            BATCH_TASKS[task_id]['running'] = False
+            await message.reply(f"🛑 **Batch {task_id} Stopped.**")
+        else:
+            await message.reply("❌ Invalid Batch ID.")
+    except:
+        await message.reply("⚠️ Usage: `/cancel <batch_id>`\nCheck IDs in `/status`")
 
-# ================= MAIN =================
+# ================= MAIN EXECUTION =================
 
 async def main():
-    print("Starting Clients...")
+    print("--- Starting Bot & Userbot ---")
     await app.start()
     await userbot.start()
-    print("✅ Bot is Alive!")
+    print("--- 🟢 System Online ---")
     await idle()
     await app.stop()
     await userbot.stop()
@@ -188,4 +242,3 @@ async def main():
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
-    
