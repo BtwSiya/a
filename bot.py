@@ -14,12 +14,13 @@ SESSION_STRING = "BQFGCokAgeUYbfqZyyM_tUlZOL9e4XM-eNqZX7_433fLwjvGB4SKL2YC6GBy-7
 
 logging.basicConfig(level=logging.ERROR)
 
+# Pyromod setup
+from pyromod import listen 
+
 app = Client("bot_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 userbot = Client("userbot_session", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
 
-# Storage
 BATCH_TASKS = {}
-USER_STATE = {} # Tracking states: {user_id: {"step": 1, "source": None}}
 
 # ================= UTILS =================
 
@@ -52,113 +53,117 @@ def extract_msg_id(link: str):
     try: return int(link.split("/")[-1])
     except: return 1
 
-# ================= ENGINE =================
+# ================= CORE ENGINE =================
 
 async def run_batch_worker(task_id):
+    """
+    Unified worker: handles both backlog and pauses 
+    elegantly to prevent double forwarding.
+    """
     task = BATCH_TASKS[task_id]
+    
     while BATCH_TASKS.get(task_id) and BATCH_TASKS[task_id]['running']:
         try:
             msg = await userbot.get_messages(task['source'], task['current'])
+            
+            # If no message yet, wait for the next pulse
             if not msg or msg.empty:
-                await asyncio.sleep(2) 
+                await asyncio.sleep(5) 
                 continue
 
             if not msg.service:
                 try:
+                    # Cloning Restricted/Normal Content
                     await userbot.copy_message(task['dest'], task['source'], msg.id)
-                    await asyncio.sleep(3) # REQUESTED: 3s Delay
+                    await asyncio.sleep(3) # Anti-Flood Delay
                 except FloodWait as e:
                     await asyncio.sleep(e.value + 2)
                 except Exception:
-                    pass 
+                    pass
+
+            # Move pointer forward after successful processing/skip
             task['current'] += 1
+
         except Exception:
             await asyncio.sleep(5)
 
-@userbot.on_message(filters.incoming)
-async def realtime_handler(client, message):
-    for tid, task in BATCH_TASKS.items():
-        if task['running'] and message.chat.id == task['source']:
-            if message.id >= task['current']:
-                try:
-                    await userbot.copy_message(task['dest'], task['source'], message.id)
-                except: pass
+# Note: Realtime listener is removed to prevent Double Forwarding. 
+# The Worker above is now fast enough to catch new messages naturally.
 
 # ================= HANDLERS =================
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message):
-    USER_STATE[message.from_user.id] = None
     text = (
-        "✨ **Premium Auto-Forwarder** ✨\n\n"
-        "Professional English Alerts & 3s Delay Active.\n"
-        "Restricted content support: **Enabled** ✅"
+        "🚀 **Enterprise Forwarder System**\n\n"
+        "Status: `Operational ✅` (24/7)\n"
+        "Protection: `Flood-Safety Active 🛡️`\n"
+        "Delay: `3 Seconds Interval`"
     )
     btns = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Start New Batch", callback_data="new_batch")],
-        [InlineKeyboardButton("📊 My Batches", callback_data="view_status")]
+        [InlineKeyboardButton("⚡ Start New Task", callback_data="new_batch")],
+        [InlineKeyboardButton("📊 System Monitor", callback_data="view_status")]
     ])
     await message.reply_text(text, reply_markup=btns)
 
 @app.on_callback_query()
 async def cb_handler(client, query: CallbackQuery):
     uid = query.from_user.id
+
     if query.data == "new_batch":
-        USER_STATE[uid] = {"step": "SOURCE"}
-        await query.message.edit_text("🔗 **Step 1:**\nSend the **Source Link or ID**.")
+        await query.message.delete()
+        try:
+            # Step 1
+            src_ask = await client.ask(uid, "📤 **Step 1:**\nSend the **Source Link** or **Chat ID**.\n(Example: `https://t.me/c/123/10`)", timeout=120)
+            source_chat = await resolve_chat(src_ask.text)
+            start_id = extract_msg_id(src_ask.text)
+            if not source_chat: return await client.send_message(uid, "❌ **Error:** Source invalid or unreachable.")
+
+            # Step 2
+            dest_ask = await client.ask(uid, "📥 **Step 2:**\nSend the **Destination Link** or **Chat ID**.", timeout=120)
+            dest_chat = await resolve_chat(dest_ask.text)
+            if not dest_chat: return await client.send_message(uid, "❌ **Error:** Destination invalid.")
+
+            task_id = random.randint(100, 999)
+            BATCH_TASKS[task_id] = {
+                "source": source_chat, "dest": dest_chat,
+                "current": start_id, "running": True, "user_id": uid
+            }
+            
+            asyncio.create_task(run_batch_worker(task_id))
+            await client.send_message(uid, f"✅ **Task {task_id} Initiated!**\nCloning started from message `{start_id}`.")
+        
+        except asyncio.TimeoutError:
+            await client.send_message(uid, "⚠️ **Session Expired:** Request timed out.")
 
     elif query.data == "view_status":
-        active = [f"🔹 `{tid}`: Msg `{data['current']}`" for tid, data in BATCH_TASKS.items() if data['running'] and data['user_id'] == uid]
-        if not active: return await query.answer("No active batches!", show_alert=True)
-        txt = "📊 **Active Tasks:**\n\n" + "\n".join(active)
-        btns = [[InlineKeyboardButton(f"🛑 Stop {t.split('`')[1]}", callback_data=f"stop_{t.split('`')[1]}")] for t in active]
-        btns.append([InlineKeyboardButton("🔙 Back", callback_data="back_home")])
+        active = [f"🔹 `Task {tid}` | Index: `{data['current']}`" for tid, data in BATCH_TASKS.items() if data['running'] and data['user_id'] == uid]
+        if not active: return await query.answer("No active processes!", show_alert=True)
+        
+        txt = "📊 **Live System Monitor:**\n\n" + "\n".join(active)
+        btns = [[InlineKeyboardButton(f"🛑 Terminate {t.split(' ')[1]}", callback_data=f"stop_{t.split(' ')[1].replace('`','')}") ] for t in active]
+        btns.append([InlineKeyboardButton("🔙 Menu", callback_data="back_home")])
         await query.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(btns))
 
     elif query.data.startswith("stop_"):
         tid = int(query.data.split("_")[1])
         if tid in BATCH_TASKS:
             BATCH_TASKS[tid]['running'] = False
-            await query.answer("Stopped!", show_alert=True)
+            await query.answer(f"Process {tid} terminated.", show_alert=True)
             await query.message.delete()
 
     elif query.data == "back_home":
         await start_handler(client, query.message)
 
-@app.on_message(filters.private & ~filters.command("start"))
-async def state_manager(client, message):
-    uid = message.from_user.id
-    if uid not in USER_STATE or not USER_STATE[uid]: return
-
-    step = USER_STATE[uid]["step"]
-    if step == "SOURCE":
-        source = await resolve_chat(message.text)
-        start_id = extract_msg_id(message.text)
-        if not source: return await message.reply("❌ Invalid Source!")
-        USER_STATE[uid] = {"step": "DEST", "source": source, "current": start_id}
-        await message.reply("📥 **Step 2:**\nSend the **Destination ID or Link**.")
-
-    elif step == "DEST":
-        dest = await resolve_chat(message.text)
-        if not dest: return await message.reply("❌ Invalid Destination!")
-        
-        data = USER_STATE[uid]
-        tid = random.randint(100, 999)
-        BATCH_TASKS[tid] = {"source": data['source'], "dest": dest, "current": data['current'], "running": True, "user_id": uid}
-        
-        USER_STATE[uid] = None
-        asyncio.create_task(run_batch_worker(tid))
-        await message.reply(f"✅ **Batch {tid} Started!**\n3s delay interval active.")
-
 # ================= BOOT =================
 
-async def main():
+async def boot():
     await app.start()
     await userbot.start()
-    print("Forwarder is Online (No-Pyromod Version)")
+    print("Forwarder is Online. Double-post fix applied.")
     await idle()
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    loop.run_until_complete(boot())
     
