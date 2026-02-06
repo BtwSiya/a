@@ -9,7 +9,7 @@ from pyrogram.errors import (
     MessageNotModified, ChatWriteForbidden, ChatAdminRequired,
     ChatForwardsRestricted
 )
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 
 # ================= CONFIGURATION =================
 API_ID = 21705136
@@ -90,7 +90,7 @@ async def run_batch_worker(task_id):
 
             if not msg.service:
                 try:
-                    # ALBUM HANDLING (1st SS Fix)
+                    # ALBUM HANDLING (Fixing the 'str' error)
                     if msg.media_group_id:
                         await update_live_report(task_id, "Detected Album (Grouping)...")
                         try:
@@ -100,23 +100,32 @@ async def run_batch_worker(task_id):
                             await update_live_report(task_id, "Downloading Restricted Album...")
                             album = await userbot.get_media_group(t['source'], msg.id)
                             media_group = []
+                            files_to_delete = []
+                            
                             for m in album:
                                 file_path = await userbot.download_media(m)
-                                media_group.append(file_path)
-                            # Re-uploading as album to maintain grouping
+                                files_to_delete.append(file_path)
+                                
+                                if m.photo:
+                                    media_group.append(InputMediaPhoto(file_path, caption=m.caption))
+                                elif m.video:
+                                    media_group.append(InputMediaVideo(file_path, caption=m.caption))
+                                else:
+                                    media_group.append(InputMediaDocument(file_path, caption=m.caption))
+                            
+                            await update_live_report(task_id, "Uploading Grouped Media...")
                             await userbot.send_media_group(t['dest'], media=media_group)
-                            for path in media_group: 
+                            
+                            for path in files_to_delete: 
                                 if os.path.exists(path): os.remove(path)
                             t['total'] += 1
                     
                     # SINGLE MESSAGE HANDLING
                     else:
                         try:
-                            # Try Direct Copy first
                             await userbot.copy_message(t['dest'], t['source'], msg.id)
                             t['total'] += 1
                         except ChatForwardsRestricted:
-                            # BYPASS LOGIC (2nd SS Fix - No more black screen)
                             await update_live_report(task_id, "File Detected: Downloading...")
                             path = await userbot.download_media(msg)
                             if path:
@@ -142,7 +151,7 @@ async def run_batch_worker(task_id):
             t['last_error'] = f"Loop Error: {str(e)}"
             await asyncio.sleep(5)
 
-# ================= UI HANDLERS =================
+# ================= UI HANDLERS (No Changes) =================
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message):
@@ -150,7 +159,7 @@ async def start_handler(_, message):
         "🚀 **Advanced Media Forwarder v5**\n\n"
         "**Features:**\n"
         "✅ Bypass Protected Content (No Black Screen)\n"
-        "✅ Album/Group Support (10 Media Max)\n"
+        "✅ Album/Group Support (Fixed Error)\n"
         "✅ Live Progress & Activity Tracking\n"
         "✅ Unlimited File Size Support"
     )
@@ -163,19 +172,14 @@ async def start_handler(_, message):
 @app.on_callback_query()
 async def cb_handler(client, query: CallbackQuery):
     uid, data = query.from_user.id, query.data
-
     if data == "new_batch":
         USER_STATE[uid] = {"step": "SOURCE"}
         await query.message.edit_text("🔗 **Step 1:**\nSend the **Source Channel Link**.")
-
     elif data == "view_status":
-        active_btns = []
-        for tid, t_info in BATCH_TASKS.items():
-            if t_info['running'] and t_info['user_id'] == uid:
-                active_btns.append([InlineKeyboardButton(f"🛑 Stop Task {tid}", callback_data=f"kill_{tid}")])
+        active_btns = [[InlineKeyboardButton(f"🛑 Stop Task {tid}", callback_data=f"kill_{tid}")] 
+                       for tid, t in BATCH_TASKS.items() if t['running'] and t['user_id'] == uid]
         if not active_btns: return await query.answer("No active tasks!", show_alert=True)
         await query.message.edit_text("📋 **Active Monitor:**", reply_markup=InlineKeyboardMarkup(active_btns))
-
     elif data.startswith("kill_"):
         tid = int(data.split("_")[1])
         if tid in BATCH_TASKS:
@@ -186,47 +190,35 @@ async def cb_handler(client, query: CallbackQuery):
 async def state_manager(client, message):
     uid = message.from_user.id
     if uid not in USER_STATE: return
-
     step = USER_STATE[uid]["step"]
     
     if step == "SOURCE":
         msg = await message.reply("🔍 Checking Source...")
         source = await resolve_chat(message.text)
         if not source: return await msg.edit("❌ **Invalid Source!**")
-        
-        start_id = 1
-        if "/" in message.text and message.text.split("/")[-1].isdigit():
-            start_id = int(message.text.split("/")[-1])
-            
+        start_id = int(message.text.split("/")[-1]) if "/" in message.text and message.text.split("/")[-1].isdigit() else 1
         USER_STATE[uid] = {"step": "DEST", "source": source, "start": start_id}
-        await msg.edit(f"✅ **Source Found!** ID: `{start_id}`\n\n📥 **Step 2:**\nSend **Destination Channel Link**.")
-
+        await msg.edit(f"✅ **Source Found!**\n\n📥 **Step 2:**\nSend **Destination Channel Link**.")
     elif step == "DEST":
         msg = await message.reply("🔍 Checking Destination...")
         dest = await resolve_chat(message.text)
         if not dest: return await msg.edit("❌ **Invalid Destination!**")
-        
-        task_data = USER_STATE[uid]
         task_id = random.randint(1000, 9999)
-        
         BATCH_TASKS[task_id] = {
-            "source": task_data['source'], "dest": dest, "current": task_data['start'],
+            "source": USER_STATE[uid]['source'], "dest": dest, "current": USER_STATE[uid]['start'],
             "total": 0, "failed": 0, "skipped": 0, "running": True,
             "user_id": uid, "log_msg_id": msg.id, "last_error": "None"
         }
-        
         del USER_STATE[uid]
         await msg.edit(f"🚀 **Task {task_id} Initialized!**")
         asyncio.create_task(run_batch_worker(task_id))
 
-# ================= BOOT =================
-
 async def main():
     await app.start()
     await userbot.start()
-    print("--- Pro Forwarder V5 Ready (Full Version) ---")
+    print("--- Pro Forwarder V5 Ready ---")
     await idle()
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
-                                
+                                                                  
