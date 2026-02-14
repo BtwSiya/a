@@ -30,14 +30,20 @@ PROCESSED_ALBUMS = []
 # ================= SMART UTILS =================
 
 async def resolve_chat(link_or_id: str):
-    """Auto-Joins and resolves Chat ID for Private/Public Channels & Groups"""
+    """
+    Robust resolver that handles:
+    1. Chat IDs (-100...)
+    2. Private Links (t.me/c/...)
+    3. Invite Links (t.me/+... or joinchat) -> Auto Joins
+    4. Public Usernames
+    """
     link_or_id = str(link_or_id).strip().rstrip("/")
     
     # 1. Direct Numeric ID
     if re.match(r"^-?\d+$", link_or_id): 
         return int(link_or_id)
     
-    # 2. Private Link with /c/ (Already joined)
+    # 2. Private Link with /c/ (Assuming already joined or will try to resolve)
     if "t.me/c/" in link_or_id:
         try:
             parts = link_or_id.split('/')
@@ -45,19 +51,23 @@ async def resolve_chat(link_or_id: str):
             return int("-100" + parts[chat_id_idx])
         except: pass
 
-    # 3. Invite Links (Auto Join)
+    # 3. Invite Links (Auto Join logic)
     if "+" in link_or_id or "joinchat" in link_or_id:
         try:
-            # Try joining
             try:
-                chat = await userbot.join_chat(link_or_id)
-                return chat.id
+                # Try joining first
+                await userbot.join_chat(link_or_id)
             except UserAlreadyParticipant:
-                # If already there, fetch info. 
-                # Note: We can't fetch by invite link if already joined, need to parse or hope we have it.
-                # Usually join_chat returns the chat object even if already joined in recent Pyrogram versions.
-                pass
+                pass # Already joined, proceed to get chat
+            
+            # After joining, we need the Chat ID. 
+            # For private invites, get_chat(invite_link) sometimes works or we need to parse.
+            # Best hack: Join, then if it's a private link, usually we can't get ID easily without context.
+            # But let's try getting chat info directly.
+            chat_info = await userbot.get_chat(link_or_id)
+            return chat_info.id
         except Exception as e:
+            # If join fails, it might be a private link format issue
             logger.error(f"Join Error: {e}")
             return None
 
@@ -77,7 +87,7 @@ async def get_thumb(msg):
     """Downloads thumbnail to fix black screen issue"""
     if not msg: return None
     try:
-        if msg.photo: return None # Photo IS the thumb
+        if msg.photo: return None 
         if msg.video and msg.video.thumbs:
             return await userbot.download_media(msg.video.thumbs[0].file_id)
         if msg.document and msg.document.thumbs:
@@ -112,13 +122,37 @@ async def run_batch_worker(task_id):
     while task_id in BATCH_TASKS and BATCH_TASKS[task_id]['running']:
         t = BATCH_TASKS[task_id]
         try:
+            # Step 1: Check if message exists
             msg = await userbot.get_messages(t['source'], t['current'])
             
-            # Message Empty or Service Msg
+            # === LIVE MONITORING LOGIC (New) ===
             if not msg or msg.empty:
-                t['skipped'] += 1
-                t['current'] += 1
-                continue
+                # Agar msg empty hai, toh check karo kya hum latest msg se aage nikal gaye?
+                try:
+                    # Get the very last message of the channel
+                    last_msgs = await userbot.get_history(t['source'], limit=1)
+                    if last_msgs:
+                        last_id_in_channel = last_msgs[0].id
+                        
+                        if t['current'] > last_id_in_channel:
+                            # Iska matlab hum future me hain, naye msg ka wait kar rahe hain
+                            await update_live_report(task_id, "👀 Waiting for New Messages...")
+                            await asyncio.sleep(10) # 10 second wait karke fir check karega
+                            continue # Loop wapis chalega same ID par check karne ke liye
+                        else:
+                            # Msg empty hai par hum latest ID se peeche hain -> Matlab Delete ho gaya
+                            t['skipped'] += 1
+                            t['current'] += 1
+                            continue
+                    else:
+                        # Channel hi empty hai
+                        await asyncio.sleep(10)
+                        continue
+                except Exception:
+                    # Agar access issue hai toh skip
+                    t['current'] += 1
+                    continue
+
             if msg.service:
                 t['current'] += 1
                 continue
@@ -135,7 +169,7 @@ async def run_batch_worker(task_id):
                     # Get all messages in the group
                     media_group = await userbot.get_media_group(t['source'], msg.id)
                     PROCESSED_ALBUMS.append(msg.media_group_id)
-                    if len(PROCESSED_ALBUMS) > 100: PROCESSED_ALBUMS.pop(0) # Keep memory low
+                    if len(PROCESSED_ALBUMS) > 100: PROCESSED_ALBUMS.pop(0) 
                     
                     # Update current ID to the last ID of this album to skip others in loop
                     last_id = max([m.id for m in media_group])
@@ -268,11 +302,11 @@ async def run_batch_worker(task_id):
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message):
     text = (
-        "🚀 **Pro Media Forwarder **\n\n"
-        "✅ **Auto Join:** Private & Public Links\n"
+        "🚀 **Pro Media Forwarder V8 (Live & Invite Fix)**\n\n"
+        "✅ **Live Forwarding:** Auto-forwards new messages\n"
+        "✅ **Join Fix:** Supports Private Invite Links\n"
         "✅ **Album Support:** Sends Grouped Media correctly\n"
-        "✅ **Black Screen Fix:** Metadata & Thumbnails Preserved\n"
-        "✅ **Unlimited Size:** Heavy Files Supported"
+        "✅ **Black Screen Fix:** Metadata & Thumbnails Preserved"
     )
     btns = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Start Forwarding", callback_data="new_batch")],
@@ -306,11 +340,11 @@ async def state_manager(client, message):
     if step == "SOURCE":
         msg = await message.reply("🔍 **Joining & Resolving Source...**")
         
-        # Extract ID if link has message ID (e.g., t.me/c/123/400)
         user_input = message.text.strip()
         start_id = 1
         link_to_resolve = user_input
         
+        # Check for ID in link (e.g. /123)
         if re.search(r"/\d+$", user_input):
             try:
                 parts = user_input.rsplit('/', 1)
@@ -320,15 +354,15 @@ async def state_manager(client, message):
             except: pass
             
         source = await resolve_chat(link_to_resolve)
-        if not source: return await msg.edit("❌ **Cannot Access Source!**\nMake sure the link is correct or the Bot is banned there.")
+        if not source: return await msg.edit("❌ **Invalid Source!**\nMake sure the Invite Link is correct.")
         
         USER_STATE[uid] = {"step": "DEST", "source": source, "start": start_id}
         await msg.edit(f"✅ **Source Found!**\nStarting from ID: `{start_id}`\n\n📥 **Step 2:** Send Destination Link.")
 
     elif step == "DEST":
-        msg = await message.reply("🔍 **Resolving Destination...**")
+        msg = await message.reply("🔍 **Joining & Resolving Destination...**")
         dest = await resolve_chat(message.text)
-        if not dest: return await msg.edit("❌ **Invalid Destination!**")
+        if not dest: return await msg.edit("❌ **Invalid Destination!**\nTry adding the Userbot to the group manually if link fails.")
         
         task_id = random.randint(1000, 9999)
         BATCH_TASKS[task_id] = {
@@ -337,15 +371,15 @@ async def state_manager(client, message):
             "user_id": uid, "log_msg_id": msg.id, "last_error": "None"
         }
         del USER_STATE[uid]
-        await msg.edit(f"🚀 **Task {task_id} Started!**\n_Media Grouping & Anti-Black Screen Enabled_")
+        await msg.edit(f"🚀 **Task {task_id} Started!**\n_Live Monitoring Active_")
         asyncio.create_task(run_batch_worker(task_id))
 
 async def main():
     await app.start()
     await userbot.start()
-    print("--- Pro Forwarder V7 Running ---")
+    print("--- Pro Forwarder V8 Running ---")
     await idle()
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
-                        
+                                                       
