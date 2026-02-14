@@ -302,7 +302,7 @@ async def run_batch_worker(task_id):
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message):
     text = (
-        "🚀 **Pro Media Forwarder V8 (Live & Invite Fix)**\n\n"
+        "🚀 **Pro Media Forwarder **\n\n"
         "✅ **Live Forwarding:** Auto-forwards new messages\n"
         "✅ **Join Fix:** Supports Private Invite Links\n"
         "✅ **Album Support:** Sends Grouped Media correctly\n"
