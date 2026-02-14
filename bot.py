@@ -274,7 +274,8 @@ async def task_worker_loop(task_id):
     
     try:
         # Step 1: Find the latest message ID in the source
-        latest_history = await userbot.get_history(t['source'], limit=1)
+        latest_history = []
+        async for m in userbot.get_chat_history(t['source'], limit=1): latest_history.append(m)
         target_end_id = latest_history[0].id if latest_history else t['current']
         
         # Step 2: Process all old messages up to the current time
