@@ -30,64 +30,33 @@ PROCESSED_ALBUMS = []
 # ================= SMART UTILS =================
 
 async def resolve_chat(link_or_id: str):
-    """
-    Robust resolver that handles:
-    1. Chat IDs (-100...)
-    2. Private Links (t.me/c/...)
-    3. Invite Links (t.me/+... or joinchat) -> Auto Joins
-    4. Public Usernames
-    """
     link_or_id = str(link_or_id).strip().rstrip("/")
-    
-    # 1. Direct Numeric ID
     if re.match(r"^-?\d+$", link_or_id): 
         return int(link_or_id)
-    
-    # 2. Private Link with /c/ (Assuming already joined or will try to resolve)
     if "t.me/c/" in link_or_id:
         try:
             parts = link_or_id.split('/')
             chat_id_idx = parts.index('c') + 1
             return int("-100" + parts[chat_id_idx])
         except: pass
-
-    # 3. Invite Links (Auto Join logic)
     if "+" in link_or_id or "joinchat" in link_or_id:
         try:
-            try:
-                # Try joining first
-                await userbot.join_chat(link_or_id)
-            except UserAlreadyParticipant:
-                pass # Already joined, proceed to get chat
-            
-            # After joining, we need the Chat ID. 
-            # For private invites, get_chat(invite_link) sometimes works or we need to parse.
-            # Best hack: Join, then if it's a private link, usually we can't get ID easily without context.
-            # But let's try getting chat info directly.
+            try: await userbot.join_chat(link_or_id)
+            except UserAlreadyParticipant: pass
             chat_info = await userbot.get_chat(link_or_id)
             return chat_info.id
         except Exception as e:
-            # If join fails, it might be a private link format issue
-            logger.error(f"Join Error: {e}")
             return None
-
-    # 4. Public Username
     try:
         username = link_or_id.split('/')[-1]
-        try: 
-            await userbot.join_chat(username)
+        try: await userbot.join_chat(username)
         except: pass
         chat = await userbot.get_chat(username)
         return chat.id
     except Exception: return None
-    
-    return None
 
 async def get_thumb(msg):
-    """Downloads thumbnail to fix black screen issue"""
-    if not msg: return None
     try:
-        if msg.photo: return None 
         if msg.video and msg.video.thumbs:
             return await userbot.download_media(msg.video.thumbs[0].file_id)
         if msg.document and msg.document.thumbs:
@@ -100,7 +69,6 @@ async def get_thumb(msg):
 async def update_live_report(task_id, activity):
     t = BATCH_TASKS.get(task_id)
     if not t: return
-    
     text = (
         f"📊 **Live Task Report: {task_id}**\n\n"
         f"✅ **Success:** `{t['total']}`\n"
@@ -122,34 +90,20 @@ async def run_batch_worker(task_id):
     while task_id in BATCH_TASKS and BATCH_TASKS[task_id]['running']:
         t = BATCH_TASKS[task_id]
         try:
-            # Step 1: Check if message exists
             msg = await userbot.get_messages(t['source'], t['current'])
             
-            # === LIVE MONITORING LOGIC (New) ===
             if not msg or msg.empty:
-                # Agar msg empty hai, toh check karo kya hum latest msg se aage nikal gaye?
                 try:
-                    # Get the very last message of the channel
-                    last_msgs = await userbot.get_history(t['source'], limit=1)
-                    if last_msgs:
-                        last_id_in_channel = last_msgs[0].id
-                        
-                        if t['current'] > last_id_in_channel:
-                            # Iska matlab hum future me hain, naye msg ka wait kar rahe hain
-                            await update_live_report(task_id, "👀 Waiting for New Messages...")
-                            await asyncio.sleep(10) # 10 second wait karke fir check karega
-                            continue # Loop wapis chalega same ID par check karne ke liye
-                        else:
-                            # Msg empty hai par hum latest ID se peeche hain -> Matlab Delete ho gaya
-                            t['skipped'] += 1
-                            t['current'] += 1
-                            continue
-                    else:
-                        # Channel hi empty hai
+                    history = await userbot.get_history(t['source'], limit=1)
+                    if history and t['current'] > history[0].id:
+                        await update_live_report(task_id, "Waiting for new messages...")
                         await asyncio.sleep(10)
                         continue
-                except Exception:
-                    # Agar access issue hai toh skip
+                    else:
+                        t['skipped'] += 1
+                        t['current'] += 1
+                        continue
+                except:
                     t['current'] += 1
                     continue
 
@@ -157,144 +111,85 @@ async def run_batch_worker(task_id):
                 t['current'] += 1
                 continue
 
-            # ================== ALBUM (GROUP) HANDLING ==================
+            # ALBUM HANDLING
             if msg.media_group_id:
                 if msg.media_group_id in PROCESSED_ALBUMS:
                     t['current'] += 1
                     continue
                 
-                await update_live_report(task_id, "📥 Detecting Album...")
-                
                 try:
-                    # Get all messages in the group
                     media_group = await userbot.get_media_group(t['source'], msg.id)
                     PROCESSED_ALBUMS.append(msg.media_group_id)
-                    if len(PROCESSED_ALBUMS) > 100: PROCESSED_ALBUMS.pop(0) 
-                    
-                    # Update current ID to the last ID of this album to skip others in loop
+                    if len(PROCESSED_ALBUMS) > 100: PROCESSED_ALBUMS.pop(0)
                     last_id = max([m.id for m in media_group])
                     
-                    # Try Direct Copy (Fastest)
                     try:
                         await userbot.copy_media_group(t['dest'], t['source'], msg.id)
                         t['total'] += len(media_group)
-                        t['current'] = last_id + 1
-                        continue
                     except ChatForwardsRestricted:
-                        pass # Fallback to Download/Upload
-                    
-                    # Restricted Content Bypass (Download -> Upload)
-                    await update_live_report(task_id, f"📥 Downloading Album ({len(media_group)} files)...")
-                    
-                    input_media_list = []
-                    files_to_clean = []
-                    
-                    for m in media_group:
-                        # Download File
-                        file_path = await userbot.download_media(m)
-                        files_to_clean.append(file_path)
-                        
-                        # Download Thumb (Crucial for Black Screen Fix)
-                        thumb_path = await get_thumb(m)
-                        if thumb_path: files_to_clean.append(thumb_path)
-                        
-                        caption = m.caption or ""
-                        
-                        if m.photo:
-                            input_media_list.append(InputMediaPhoto(file_path, caption=caption))
-                        elif m.video:
-                            input_media_list.append(
-                                InputMediaVideo(
-                                    file_path, 
-                                    caption=caption,
-                                    thumb=thumb_path, 
-                                    width=m.video.width, 
-                                    height=m.video.height, 
-                                    duration=m.video.duration,
-                                    supports_streaming=True
-                                )
-                            )
-                        elif m.document:
-                             input_media_list.append(InputMediaDocument(file_path, caption=caption, thumb=thumb_path))
-                        elif m.audio:
-                             input_media_list.append(InputMediaAudio(file_path, caption=caption, thumb=thumb_path, duration=m.audio.duration))
+                        await update_live_report(task_id, "Processing Album Bypass...")
+                        input_media = []
+                        temp_files = []
+                        for m in media_group:
+                            path = await userbot.download_media(m)
+                            temp_files.append(path)
+                            thumb = await get_thumb(m)
+                            if thumb: temp_files.append(thumb)
+                            
+                            cap = m.caption or ""
+                            if m.photo: input_media.append(InputMediaPhoto(path, caption=cap))
+                            elif m.video: input_media.append(InputMediaVideo(path, caption=cap, thumb=thumb, width=m.video.width, height=m.video.height, duration=m.video.duration, supports_streaming=True))
+                            elif m.document: input_media.append(InputMediaDocument(path, caption=cap, thumb=thumb))
+                            elif m.audio: input_media.append(InputMediaAudio(path, caption=cap, thumb=thumb, duration=m.audio.duration))
 
-                    if input_media_list:
-                        await update_live_report(task_id, "📤 Uploading Album...")
-                        await userbot.send_media_group(t['dest'], media=input_media_list)
+                        await userbot.send_media_group(t['dest'], media=input_media)
                         t['total'] += len(media_group)
-                    
-                    # Cleanup
-                    for f in files_to_clean:
-                        if f and os.path.exists(f): os.remove(f)
-                        
+                        for f in temp_files:
+                            if f and os.path.exists(f): os.remove(f)
+
                     t['current'] = last_id + 1
                     continue
-
                 except Exception as e:
                     t['failed'] += 1
-                    t['last_error'] = f"Album Fail: {str(e)[:50]}"
-                    t['current'] += 1 # Try to move on
+                    t['last_error'] = str(e)[:50]
+                    t['current'] += 1
                     continue
 
-            # ================== SINGLE MESSAGE HANDLING ==================
+            # SINGLE MESSAGE
             else:
                 try:
-                    await userbot.copy_message(t['dest'], t['source'], msg.id)
+                    if msg.text:
+                        await userbot.send_message(t['dest'], msg.text, entities=msg.entities)
+                    else:
+                        try:
+                            await userbot.copy_message(t['dest'], t['source'], msg.id)
+                        except ChatForwardsRestricted:
+                            await update_live_report(task_id, "Processing File Bypass...")
+                            path = await userbot.download_media(msg)
+                            thumb = await get_thumb(msg)
+                            cap = msg.caption or ""
+                            
+                            if msg.photo: await userbot.send_photo(t['dest'], path, caption=cap)
+                            elif msg.video: await userbot.send_video(t['dest'], path, caption=cap, thumb=thumb, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, supports_streaming=True)
+                            elif msg.document: await userbot.send_document(t['dest'], path, caption=cap, thumb=thumb)
+                            elif msg.audio: await userbot.send_audio(t['dest'], path, caption=cap, thumb=thumb, duration=msg.audio.duration)
+                            elif msg.voice: await userbot.send_voice(t['dest'], path, caption=cap)
+                            
+                            if path and os.path.exists(path): os.remove(path)
+                            if thumb and os.path.exists(thumb): os.remove(thumb)
                     t['total'] += 1
-                except ChatForwardsRestricted:
-                    # RESTRICTED CONTENT BYPASS
-                    await update_live_report(task_id, "📥 Downloading File...")
-                    
-                    try:
-                        file_path = await userbot.download_media(msg)
-                        thumb_path = await get_thumb(msg)
-                        
-                        await update_live_report(task_id, "📤 Uploading File...")
-                        
-                        if msg.photo:
-                            await userbot.send_photo(t['dest'], file_path, caption=msg.caption)
-                        elif msg.video:
-                            # FIX: Passing Metadata to prevent Black Screen
-                            await userbot.send_video(
-                                t['dest'], 
-                                file_path, 
-                                caption=msg.caption,
-                                thumb=thumb_path,
-                                duration=msg.video.duration,
-                                width=msg.video.width,
-                                height=msg.video.height,
-                                supports_streaming=True
-                            )
-                        elif msg.document:
-                             await userbot.send_document(t['dest'], file_path, caption=msg.caption, thumb=thumb_path)
-                        elif msg.voice:
-                             await userbot.send_voice(t['dest'], file_path, caption=msg.caption)
-                        elif msg.audio:
-                             await userbot.send_audio(t['dest'], file_path, caption=msg.caption, thumb=thumb_path, duration=msg.audio.duration)
-                        else:
-                            # Fallback for text/stickers
-                             if msg.text: await userbot.send_message(t['dest'], msg.text)
-                        
-                        # Cleanup
-                        if file_path and os.path.exists(file_path): os.remove(file_path)
-                        if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-                        
-                        t['total'] += 1
-
-                    except Exception as e:
-                        t['failed'] += 1
-                        t['last_error'] = f"Bypass Fail: {str(e)[:50]}"
+                except Exception as e:
+                    t['failed'] += 1
+                    t['last_error'] = str(e)[:50]
 
             t['current'] += 1
-            await update_live_report(task_id, "⏳ Waiting...")
-            await asyncio.sleep(2) # Safe delay
+            await update_live_report(task_id, "Waiting...")
+            await asyncio.sleep(2)
 
         except FloodWait as e:
-            await update_live_report(task_id, f"😴 Sleep {e.value}s")
             await asyncio.sleep(e.value + 5)
         except Exception as e:
-            t['last_error'] = f"Loop Error: {str(e)[:50]}"
+            t['last_error'] = str(e)[:50]
             await asyncio.sleep(5)
 
 # ================= UI HANDLERS =================
@@ -302,15 +197,15 @@ async def run_batch_worker(task_id):
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(_, message):
     text = (
-        "🚀 **Pro Media Forwarder V8 (Live & Invite Fix)**\n\n"
-        "✅ **Live Forwarding:** Auto-forwards new messages\n"
-        "✅ **Join Fix:** Supports Private Invite Links\n"
-        "✅ **Album Support:** Sends Grouped Media correctly\n"
-        "✅ **Black Screen Fix:** Metadata & Thumbnails Preserved"
+        "🚀 **Pro Media Forwarder**\n\n"
+        "✅ Live Forwarding Enabled\n"
+        "✅ Private & Public Support\n"
+        "✅ Album & Text Support\n"
+        "✅ Black Screen Fix Active"
     )
     btns = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Start Forwarding", callback_data="new_batch")],
-        [InlineKeyboardButton("📊 Active Tasks", callback_data="view_status")]
+        [InlineKeyboardButton("➕ Start Task", callback_data="new_batch")],
+        [InlineKeyboardButton("📊 Tasks", callback_data="view_status")]
     ])
     await message.reply_text(text, reply_markup=btns)
 
@@ -319,17 +214,15 @@ async def cb_handler(client, query: CallbackQuery):
     uid, data = query.from_user.id, query.data
     if data == "new_batch":
         USER_STATE[uid] = {"step": "SOURCE"}
-        await query.message.edit_text("🔗 **Step 1: Source**\nSend Public/Private Link (e.g., `https://t.me/+AbCd123` or `t.me/c/123/100`).")
+        await query.message.edit_text("🔗 **Step 1:**\nSend Source Link.")
     elif data == "view_status":
-        active_btns = [[InlineKeyboardButton(f"🛑 Stop Task {tid}", callback_data=f"kill_{tid}")] 
-                       for tid, t in BATCH_TASKS.items() if t['running'] and t['user_id'] == uid]
-        if not active_btns: return await query.answer("No active tasks!", show_alert=True)
-        await query.message.edit_text("📋 **Active Monitor:**", reply_markup=InlineKeyboardMarkup(active_btns))
+        btns = [[InlineKeyboardButton(f"🛑 Stop {tid}", callback_data=f"kill_{tid}")] for tid, t in BATCH_TASKS.items() if t['running'] and t['user_id'] == uid]
+        if not btns: return await query.answer("No active tasks!")
+        await query.message.edit_text("📋 **Active Tasks:**", reply_markup=InlineKeyboardMarkup(btns))
     elif data.startswith("kill_"):
         tid = int(data.split("_")[1])
-        if tid in BATCH_TASKS:
-            BATCH_TASKS[tid]['running'] = False
-            await query.message.edit_text(f"✅ **Task {tid} Stopped.**")
+        if tid in BATCH_TASKS: BATCH_TASKS[tid]['running'] = False
+        await query.message.edit_text(f"✅ Task {tid} stopped.")
 
 @app.on_message(filters.private & ~filters.command("start"))
 async def state_manager(client, message):
@@ -338,48 +231,36 @@ async def state_manager(client, message):
     step = USER_STATE[uid]["step"]
     
     if step == "SOURCE":
-        msg = await message.reply("🔍 **Joining & Resolving Source...**")
-        
         user_input = message.text.strip()
         start_id = 1
-        link_to_resolve = user_input
-        
-        # Check for ID in link (e.g. /123)
+        link = user_input
         if re.search(r"/\d+$", user_input):
-            try:
-                parts = user_input.rsplit('/', 1)
-                if parts[1].isdigit():
-                    start_id = int(parts[1])
-                    link_to_resolve = parts[0]
-            except: pass
+            parts = user_input.rsplit('/', 1)
+            start_id = int(parts[1])
+            link = parts[0]
             
-        source = await resolve_chat(link_to_resolve)
-        if not source: return await msg.edit("❌ **Invalid Source!**\nMake sure the Invite Link is correct.")
-        
+        source = await resolve_chat(link)
+        if not source: return await message.reply("❌ Invalid Source!")
         USER_STATE[uid] = {"step": "DEST", "source": source, "start": start_id}
-        await msg.edit(f"✅ **Source Found!**\nStarting from ID: `{start_id}`\n\n📥 **Step 2:** Send Destination Link.")
+        await message.reply("📥 **Step 2:**\nSend Destination Link.")
 
     elif step == "DEST":
-        msg = await message.reply("🔍 **Joining & Resolving Destination...**")
         dest = await resolve_chat(message.text)
-        if not dest: return await msg.edit("❌ **Invalid Destination!**\nTry adding the Userbot to the group manually if link fails.")
-        
+        if not dest: return await message.reply("❌ Invalid Destination!")
         task_id = random.randint(1000, 9999)
+        msg = await message.reply("🚀 Initializing...")
         BATCH_TASKS[task_id] = {
             "source": USER_STATE[uid]['source'], "dest": dest, "current": USER_STATE[uid]['start'],
             "total": 0, "failed": 0, "skipped": 0, "running": True,
             "user_id": uid, "log_msg_id": msg.id, "last_error": "None"
         }
         del USER_STATE[uid]
-        await msg.edit(f"🚀 **Task {task_id} Started!**\n_Live Monitoring Active_")
         asyncio.create_task(run_batch_worker(task_id))
 
 async def main():
     await app.start()
     await userbot.start()
-    print("--- Pro Forwarder V8 Running ---")
     await idle()
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())
-                                                       
