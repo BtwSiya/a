@@ -14,7 +14,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQ
 # ================= CONFIGURATION =================
 API_ID = 21705136
 API_HASH = "78730e89d196e160b0f1992018c6cb19"
-BOT_TOKEN = "8572528424:AAG3Bk4L-xnpmu2IWMfRS_m5AG8foG7cPRc"
+BOT_TOKEN = "8309447910:AAFjPO_GzbbNVB50fqxCVady1lkvRSX3cXY"
 DATA_FILE = "data.json"
 
 logging.basicConfig(level=logging.ERROR)
